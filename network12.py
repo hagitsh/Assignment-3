@@ -8,7 +8,7 @@ def compute_mse_and_acc(nnet, X, y, num_labels=10, minibatch_size=100):
     minibatch_gen = minibatch_generator(X, y, minibatch_size)
 
     for i, (features, targets) in enumerate(minibatch_gen):
-        _, probas = nnet.forward(features)
+        _, _, probas = nnet.forward(features)
         predicted_labels = np.argmax(probas, axis=1)
 
         onehot_targets = int_to_onehot(targets, num_labels=num_labels)
@@ -69,15 +69,19 @@ def train(model, X_train, y_train, X_valid, y_valid, num_epochs,
 
         for X_train_mini, y_train_mini in minibatch_gen:
             #### Compute outputs ####
-            a_h, a_out = model.forward(X_train_mini)
+            a_h, a_h2, a_out = model.forward(X_train_mini)
 
             #### Compute gradients ####
-            d_loss__d_w_out, d_loss__d_b_out, d_loss__d_w_h, d_loss__d_b_h = \
-                model.backward(X_train_mini, a_h, a_out, y_train_mini)
+            d_loss__d_w_out, d_loss__d_b_out, \
+            d_loss__d_w_h, d_loss__d_b_h, \
+            d_loss__d_w_h2, d_loss__d_b_h2 = \
+                model.backward(X_train_mini, a_h, a_h2, a_out, y_train_mini)
 
             #### Update weights ####
             model.weight_h -= learning_rate * d_loss__d_w_h
             model.bias_h -= learning_rate * d_loss__d_b_h
+            model.weight_h2 -= learning_rate * d_loss__d_w_h2
+            model.bias_h2 -= learning_rate * d_loss__d_b_h2
             model.weight_out -= learning_rate * d_loss__d_w_out
             model.bias_out -= learning_rate * d_loss__d_b_out
 
@@ -104,15 +108,22 @@ class NeuralNetMLP:
         self.num_classes = num_classes
 
         # hidden
+        # 1st layer
         rng = np.random.RandomState(random_seed)
 
         self.weight_h = rng.normal(
             loc=0.0, scale=0.1, size=(num_hidden, num_features))
         self.bias_h = np.zeros(num_hidden)
+        # 2nd layer weights (size * 2 than the first layer)
+        rng = np.random.RandomState(random_seed)
+
+        self.weight_h2 = rng.normal(
+            loc=0.0, scale=0.1, size=(num_hidden * 2, num_hidden))
+        self.bias_h2 = np.zeros(num_hidden * 2)
 
         # output
         self.weight_out = rng.normal(
-            loc=0.0, scale=0.1, size=(num_classes, num_hidden))
+            loc=0.0, scale=0.1, size=(num_classes, num_hidden * 2))
         self.bias_out = np.zeros(num_classes)
 
     def forward(self, x):
@@ -121,15 +132,19 @@ class NeuralNetMLP:
         # output dim: [n_examples, n_hidden]
         z_h = np.dot(x, self.weight_h.T) + self.bias_h
         a_h = sigmoid(z_h)
+        # the second layer
+        z_h2 = np.dot(a_h, self.weight_h2.T) + self.bias_h2
+        a_h2 = sigmoid(z_h2)
 
         # Output layer
-        # input dim: [n_examples, n_hidden] dot [n_classes, n_hidden].T
+        # input dim: [n_examples, n_hidden * 2] dot [n_classes, n_hidden * 2].T
         # output dim: [n_examples, n_classes]
-        z_out = np.dot(a_h, self.weight_out.T) + self.bias_out
+        z_out = np.dot(a_h2, self.weight_out.T) + self.bias_out
+        # z_out = np.dot(a_h, self.weight_out.T) + self.bias_out
         a_out = sigmoid(z_out)
-        return a_h, a_out
+        return a_h, a_h2, a_out
 
-    def backward(self, x, a_h, a_out, y):
+    def backward(self, x, a_h1, a_h2, a_out, y):
         #########################
         ### Output layer weights
         #########################
@@ -153,10 +168,11 @@ class NeuralNetMLP:
 
         # gradient for output weights
 
-        # [n_examples, n_hidden]
-        d_z_out__dw_out = a_h
+        # [n_examples, n_hidden * 2]
+        # the last layer before out is now layer 2 (size = n_hidden * 2)
+        d_z_out__dw_out = a_h2
 
-        # input dim: [n_classes, n_examples] dot [n_examples, n_hidden]
+        # input dim: [n_classes, n_examples] dot [n_examples, n_hidden * 2]
         # output dim: [n_classes, n_hidden]
         d_loss__dw_out = np.dot(delta_out.T, d_z_out__dw_out)
         d_loss__db_out = np.sum(delta_out, axis=0)
@@ -165,14 +181,33 @@ class NeuralNetMLP:
         # Part 2: dLoss/dHiddenWeights
         ## = DeltaOut * dOutNet/dHiddenAct * dHiddenAct/dHiddenNet * dHiddenNet/dWeight
 
-        # [n_classes, n_hidden]
-        d_z_out__a_h = self.weight_out
+        # [n_classes, n_hidden * 2]
+        d_z_out__a_h2 = self.weight_out
 
-        # output dim: [n_examples, n_hidden]
-        d_loss__a_h = np.dot(delta_out, d_z_out__a_h)
+        # output dim: [n_examples, n_hidden * 2]
+        # delta_out is for the final layer loss, d_z_out__a_h are the final layer weights
+        d_loss__a_h2 = np.dot(delta_out, d_z_out__a_h2)
+
+        # [n_examples, n_hidden * 2]
+        d_a_h__d_z_h2 = a_h2 * (1. - a_h2)  # sigmoid derivative
 
         # [n_examples, n_hidden]
-        d_a_h__d_z_h = a_h * (1. - a_h)  # sigmoid derivative
+        d_z_h__d_w_h2 = a_h1
+
+        # output dim: [n_hidden * 2, n_features]
+        delta_out_h2 = d_loss__a_h2 * d_a_h__d_z_h2
+        d_loss__d_w_h2 = np.dot(delta_out_h2.T, d_z_h__d_w_h2)
+        d_loss__d_b_h2 = np.sum(delta_out_h2, axis=0)
+
+        # [n_classes, n_hidden * 2]
+        d_z_out__a_h = self.weight_h2
+
+        # output dim: [n_examples, n_hidden * 2]
+        # delta_out is for the final layer loss, d_z_out__a_h are the final layer weights
+        d_loss__a_h = np.dot(delta_out_h2, d_z_out__a_h)
+
+        # [n_examples, n_hidden]
+        d_a_h__d_z_h = a_h1 * (1. - a_h1)
 
         # [n_examples, n_features]
         d_z_h__d_w_h = x
@@ -182,4 +217,5 @@ class NeuralNetMLP:
         d_loss__d_b_h = np.sum((d_loss__a_h * d_a_h__d_z_h), axis=0)
 
         return (d_loss__dw_out, d_loss__db_out,
-                d_loss__d_w_h, d_loss__d_b_h)
+                d_loss__d_w_h, d_loss__d_b_h,
+                d_loss__d_w_h2, d_loss__d_b_h2)
